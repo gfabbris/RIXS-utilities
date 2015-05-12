@@ -6,7 +6,7 @@ from scipy.optimize import curve_fit
 import scipy.interpolate as intp
 import robust
 import zipfile
-import os, pyfits, pdb
+import os, pyfits
 
 class CCD:
     """CCD RIXS image with associated processing and plotting
@@ -27,7 +27,7 @@ class CCD:
             CCD.background      Sum of all BGspecs [x [in pixels], y, e] list of numpy arrays
             CCD.correlations    List of correlation functions
  
-            CCD.photon_E        Energy of incident photons
+            CCD.photon_E        Energy of incident photons. Used for electrons -> photon intensity conversion
             CCD.curvature       polynominal describing curvature
             CCD.poly_order      Order of polynominal describing Curvature
                                 order = 3 imples x**0 + x**1 + x**2
@@ -43,13 +43,18 @@ class CCD:
                                 
             CCD.shifts          Numbers of pixels the spectra were shifted in CCD.correlate() 
                                 proceedure
+            
+            CCD.file_header     The raw text extracted out of the image file
+            CCD.file_dictionary Python dictionary created from CCD.file_header
                                 
     Processes:
     -----------            
             CCD.clean()         reject cosmic rays above threshold
             CCD.clean_std()     reject cosmic rays depending on deviation 
-                                for mean values in row trajectory
+                                for mean values in curvature-corrected row trajectory
             CCD.sub_backgrounds() subtract BGimages from images
+                                At this point the signal is converted from electrons to
+                                photons
             CCD.plot()          plot CCD image
             CCD.get_curvature() determine curvature
             CCD.get_specs()     bin CCD images into 1D using current curvature
@@ -59,15 +64,23 @@ class CCD:
             CCD.sum_specs()     sum 1D specs together into CCD.spectrum ...
                                 and sum 1D BGspecs togetehr into CCD.specground
             CCD.bin_points()    Bin points together
-    
+            
     Internal Processes:
     -------------------
-            CCD._gendark        Generate the dark image when none is specified
-            CCD._clean_std      get image array with cosmic rays removed 
+            CCD._gendark()      Generate the dark image when none is specified.
+                                This is computed from the average of the edge of the image.
+            CCD._clean_std()    get image array with cosmic rays removed 
                                 based on deviation from mean
+            CCD._get_header()   Reads the header out of the CCD file and writes
+                                it into CCD.file_header & CCD.file_dictionary.
+                                This is designed for SLS data. It probably needs 
+                                to be changed to other facilities.
+            CCD._verbose        
     """ 
 
-    def __init__(self, fname_list=[], photon_E=930., poly_order=3, binpix=8, fileout='test.dat', fname_list_BG =[], exclude=[None, None]):
+    def __init__(self, fname_list=[], photon_E=930., poly_order=3, binpix=8, 
+                 fileout='test.dat', fname_list_BG =[], exclude=[None, None],
+                 verbose=True):
         """ Initiate class
         loading raw data from list of strings describing filesnames. 
         Various values (defined above) are initiated to
@@ -79,54 +92,67 @@ class CCD:
         self.fname_list = fname_list
         self.fname_BG = fname_list_BG
         self.exclude = exclude
+        self._verbose = verbose
         self.shifts = []
         self.fileout = fileout
         
         self.raw_images = []
         for fname in fname_list:
+            if self._verbose:
+                print "Loading {}".format(fname)
             if fname[-4:] == 'fits':
                 fitsobj = pyfits.open(fname)
-                M = fitsobj[2].data
+                self.raw_images.append(fitsobj[2].data)
             else:
                 try:
                     self.raw_images.append(plt.imread(fname + '.tif'))
+                    self._get_header(fname + '.tif')
                 except IOError:
-                    z = zipfile.ZipFile(fname + '.zip')
-                    z.extract(z.namelist()[0], path=os.path.dirname(fname))
-                    self.raw_images.append(plt.imread(fname + '.tif'))
-                    zout = zipfile.ZipFile(fname + '.zip', "w")
-                    zout.close()
-            self.raw_images.append(M)
+                    try:
+                        z = zipfile.ZipFile(fname + '.zip')
+                        z.extract(z.namelist()[0], path=os.path.dirname(fname))
+                        self.raw_images.append(plt.imread(fname + '.tif'))
+                        self._get_header(fname + '.tif')
+                        zout = zipfile.ZipFile(fname + '.zip', "w")
+                        zout.close()
+                    except IOError:
+                        print "Didn't find {}!".format(fname)
+                        raise IOError
 
         if len(fname_list_BG) == 1:
             fname_list_BG = fname_list_BG * len(fname_list)
         self.raw_BGimages = []
         for fname_BG in fname_list_BG:
+            if self._verbose:
+                print "Loading background {}".format(fname_BG)
             if fname_BG[-4:] == 'fits':
                 fitsobj = pyfits.open(fname_BG)
-                M = fitsobj[2].data
+                self.raw_BGimages.append(fitsobj[2].data)
             else:
                 try:
                     self.raw_BGimages.append(plt.imread(fname_BG + '.tif'))
                 except IOError:
-                    z = zipfile.ZipFile(fname_BG + '.zip')
-                    z.extract(z.namelist()[0], path=os.path.dirname(fname_BG))
-                    self.raw_BGimages.append(plt.imread(fname_BG + '.tif'))
-                    zout = zipfile.ZipFile(fname_BG + '.zip', "w")
-                    zout.close()
-            self.raw_BGimages.append(M)
+                    try:
+                        z = zipfile.ZipFile(fname_BG + '.zip')
+                        z.extract(z.namelist()[0], path=os.path.dirname(fname_BG))
+                        self.raw_BGimages.append(plt.imread(fname_BG + '.tif'))
+                        zout = zipfile.ZipFile(fname_BG + '.zip', "w")
+                        zout.close()
+                    except IOError:
+                        print "Didn't find background {}!".format(fname_BG)
+                        raise IOError
        
         if self.raw_BGimages == []:
+            if self._verbose:
+                    print "Generating the dark images, as no file was specified"
             for M in self.raw_images:
-                #print "Generating the dark images"
                 self.raw_BGimages.append(self._gen_dark(M))
         
 ################ PROCESSES FOR DATA ##################
    
     def clean(self, thHIGH):
         """ Remove background.
-        gainregion  = indlow:indhigh defining energy gain rows on array
-        e.g. 0:500 and set values above thHIGH to 0
+        values above thHIGH are set to the mean value of the image
         """
         
         self.images = []
@@ -137,7 +163,8 @@ class CCD:
             self.images.append(clean_image)
             
             changed_pixels = np.sum(image != clean_image) / ( len(image.flat)  + 0.0) # force float
-            print "Image: {0} % of pixels rejected".format(changed_pixels*100)
+            if self._verbose:
+                print "Image: {:.2f} % of pixels rejected".format(changed_pixels*100)
      
         self.BGimages = []
         for BGimage in self.raw_BGimages:
@@ -147,45 +174,45 @@ class CCD:
             self.BGimages.append(clean_BGimage)
 
             changed_pixels = np.sum(BGimage != clean_BGimage) / ( len(BGimage.flat)  + 0.0) # force float
-            print "Background: {0} % of pixels rejected".format(changed_pixels*100)
+            if self._verbose:
+                print "Background: {:.1f} % of pixels rejected".format(changed_pixels*100)
 
     def clean_old(self, thHIGH):
         """ Remove background and convert from electrons to photons 
         gainregion  = indlow:indhigh defining energy gain rows on array
         e.g. 0:500        
         and set values above thHIGH to 0
+        Images are still in units of electrons
         """
         
         self.images = []
-        for image in self.raw_images:            
-            e_per_ph = self.photon_E /  3.65
-            image = image / e_per_ph;  
+        for image in self.raw_images:             
             clean_image = np.copy(image)
             meanimage = np.mean(image[image < thHIGH])
             clean_image[clean_image > thHIGH] = meanimage
             self.images.append(clean_image)
             
             changed_pixels = np.sum(image != clean_image) / ( len(image.flat)  + 0.0) # force float
-            print "Image: {0} % of pixels rejected".format(changed_pixels*100)
+            if self._verbose:
+                print "Image: {:.1f} % of pixels rejected".format(changed_pixels*100)
      
         self.BGimages = []
-        for BGimage in self.raw_BGimages:
-            e_per_ph = self.photon_E /  3.65
-            BGimage = BGimage / e_per_ph;  
+        for BGimage in self.raw_BGimages: 
             clean_BGimage = np.copy(BGimage)
             meanBGimage = np.mean(BGimage[BGimage < thHIGH])
             clean_BGimage[clean_BGimage > thHIGH] = meanBGimage
             self.BGimages.append(clean_BGimage)
 
             changed_pixels = np.sum(BGimage != clean_BGimage) / ( len(BGimage.flat)  + 0.0) # force float
-            print "Background: {0} % of pixels rejected".format(changed_pixels*100)                      
+            if self._verbose:
+                print "Background: {:.1f} % of pixels rejected".format(changed_pixels*100)                      
     
     def clean_std_new(self, noise):
         """
         Removes background based on the average intensity at each energy loss
         and its standard deviation. This process is iterated len(noise) times
         as the presence of a large count in a pixel screws up the average and
-        standart deviation.
+        standart deviation. Images are still in units of electrons.
         """
         self.images = []
         for image in self.raw_images:
@@ -194,7 +221,8 @@ class CCD:
             self.images.append(clean_image)
             
             changed_pixels = np.sum(image != clean_image) / ( len(image.flat)  + 0.0) # force float
-            #print "Image: {0} % of pixels rejected".format(changed_pixels*100)
+            if self._verbose:
+                print "Image: {:.1f} % of pixels rejected".format(changed_pixels*100)
 
         
         self.BGimages = []
@@ -204,12 +232,13 @@ class CCD:
             self.BGimages.append(clean_BGimage)
             
             changed_pixels = np.sum(BGimage != clean_BGimage) / ( len(BGimage.flat)  + 0.0) # force float
-            #print "Background: {0} % of pixels rejected".format(changed_pixels*100)    
+            if self._verbose:
+                print "Background: {:.1f} % of pixels rejected".format(changed_pixels*100)    
     
     def clean_std(self, noise):
         """
         Removes background based on the average intensity at each energy loss
-        and its standard deviation.
+        and its standard deviation. Images are still in units of electrons at the point.
         """
         self.images = []
         for image in self.raw_images:
@@ -219,32 +248,29 @@ class CCD:
             self.images.append(clean_image)
             
             changed_pixels = np.sum(image != clean_image) / ( len(image.flat)  + 0.0) # force float
-            print "Image: {0} % of pixels rejected".format(changed_pixels*100)
+            if self._verbose:
+                print "Image: {:.1f} % of pixels rejected".format(changed_pixels*100)
 
         
         self.BGimages = []
         for BGimage in self.raw_BGimages:
             clean_BGimage = self._clean_std(BGimage, noise)
-            e_per_ph = self.photon_E /  3.65
-            clean_BGimage = clean_BGimage / e_per_ph;
             self.BGimages.append(clean_BGimage)
             
             changed_pixels = np.sum(BGimage != clean_BGimage) / ( len(BGimage.flat)  + 0.0) # force float
-            print "Background: {0} % of pixels rejected".format(changed_pixels*100)
+            if self._verbose:
+                print "Background: {:.1f} % of pixels rejected".format(changed_pixels*100)
 
     
     def sub_backgrounds(self):
+        """ Subtract backgrounds and convert from electrons to photons"""
         for i in range(len(self.images)):
             e_per_ph = self.photon_E /  3.65
             self.images[i] = (self.images[i] - self.BGimages[i])/e_per_ph
-            
-    def sub_backgrounds_old(self):
-        for i in range(len(self.images)):
-            self.images[i] = self.images[i] - self.BGimages[i]
 
     def get_curvature(self, index=0):
         """ Determine the curvature of the CCD image specified by index
-        The data are binned in columns *binpix* pixels wide
+        The data are binned in columns self.binpix pixels wide
         a correlation function is calculated using the central set of pixels
         as a reference. The peaks of each binned column is then fit by a polynominal """
         M = self.images[index]
@@ -286,7 +312,8 @@ class CCD:
             offset  = currentPeak - currentOffset
         self.curvature[-1:] += offset
         self.info_peaks += offset
-        print "Curvature was offst by %f" %offset
+        if self.verbose:
+            print "Curvature was offst by {:.2f}".format(offset)
            
 ###################### BINNING AND SUMMING #################
 
@@ -321,6 +348,47 @@ class CCD:
             y = np.sum(M_shifted[:,self.exclude[0]:self.exclude[1]], axis=1)
             inds = ~np.logical_or(np.isnan(x), np.isnan(y))
             self.BGspecs.append([x.transpose()[inds], y.transpose()[inds]])
+            
+    def get_specs_error(self):
+        """ Extract the single spectra using the predefined curvature. Calculate error based
+        on the standard variation across the image"""
+        # Generate specs from images
+        y = np.arange(np.shape(self.images[0])[0])  # a column
+        p = np.hstack((self.curvature[:-1], 0))
+                
+        self.specs = []
+        M_shifted = np.zeros(np.shape(self.images[0]))  # will be filled with image with columns shifted to cancel the curvature
+        for image in self.images:
+            for col in range(np.shape(image)[1]):
+                M_shifted[:, col] = np.interp(y, y - np.polyval(p, col), image[:, col],
+                                           left=np.NaN, right=np.NaN)
+            I = np.sum(M_shifted[:,self.exclude[0]:self.exclude[1]], axis=1)
+            
+            if (np.abs(self.exclude[0]-self.exclude[1])+1) < len(M_shifted[0,:]):
+                num_points = np.abs(self.exclude[0]-self.exclude[1])+1
+            else:
+                num_points = len(M_shifted[0,:])
+            
+            std = np.sqrt(num_points)*np.std(M_shifted[:,self.exclude[0]:self.exclude[1]], axis=1)
+
+            inds = ~np.logical_or(np.isnan(I), np.isnan(I))
+            self.specs.append([y.transpose()[inds], I.transpose()[inds], std.transpose()[inds]])
+  
+        self.info_shifted = M_shifted
+    
+        # Generate BGspecs from background images
+        x = np.arange(np.shape(self.BGimages[0])[0])
+        p = np.hstack((self.curvature[:-1], 0))
+        
+        self.BGspecs = []
+        M_shifted = np.zeros(np.shape(self.BGimages[0]))  # will be filled with image with columns shifted to cancel the curvature
+        for BGimage in self.BGimages:
+            for col in range(np.shape(BGimage)[1]):
+                M_shifted[:, col] = np.interp(x, x - np.polyval(p, col), BGimage[:, col],
+                                           left=np.NaN, right=np.NaN)
+            y = np.sum(M_shifted[:,self.exclude[0]:self.exclude[1]], axis=1)
+            inds = ~np.logical_or(np.isnan(x), np.isnan(y))
+            self.BGspecs.append([x.transpose()[inds], y.transpose()[inds]])
 
 
     def correlate_specs(self):
@@ -338,12 +406,12 @@ class CCD:
             self.correlations.append(sp.correlate(ref, currfine,  mode='full'))
         for i in range(1, len(self.specs)):
             shift = np.argmax(self.correlations[i]) - np.argmax(self.correlations[0])
-            print shift
-            shift = shift * dx
-            print shift
-            print "spectrum %d shifted by %f" % (i, shift)           
+            shift = shift * dx           
             self.specs[i][0] = self.specs[i][0] + shift
             self.shifts.append(shift)
+            if self._verbose:
+                print "spectrum {:d} shifted by {:.2f}".format(i, shift)
+
 
     def sum_specs(self):
         """ Sum the specs into one spectrum. And the bgspecs into background
@@ -408,36 +476,98 @@ class CCD:
 #        self.spectrum[0] = (elastic_pixel - self.spectrum[0]) *  E_per_pix 
 #        self.spectrum[0] = np.polyv
 
-    def shift_e(self, func = 'gauss'):
+    def fit_elastic(self, cen=None, sigma=None, I0=None, offset=None, x_window=[-np.inf, np.inf]):
+        """ 
+        Fit gaussian to the spectrum in order to determine the pixel correponding to the elastic line.
+        x_window is a list that cuts the spectrum between x_window[0] and x_window[1]        
+        cen=, sigma=None, I0=None, offset=None
+        """
+        def gauss(x, cen, sigma, I0, offset):
+            return I0 * np.exp(-(x-cen)**2/(2*sigma**2)) + offset
+
+        keep_inds = (self.spectrum[0] > x_window[0]) & (self.spectrum[0] < x_window[1])
+        x = self.spectrum[0][keep_inds]
+        y = self.spectrum[1][keep_inds]
+        
+        if cen == None:
+            try:
+                index = np.argmax(y)
+                cen = x[index]
+            except ValueError:
+                print 'Failed to initialize peak center!'
+                return -100
+        if sigma == None:
+            sigma = (np.max(x) - np.min(x)) / 4
+        if I0 == None:
+            I0 = np.max(y)
+        if offset == None:
+            offset = np.min(y)
+        
+        #print "cen = {}, sigma = {}, I0 = {}, offset = {}".format(cen, sigma, I0, offset)
+        try:        
+            popt, pcov = curve_fit(gauss, x, y, p0=[cen, sigma, I0, offset])    
+        except RuntimeError:
+            print 'Fit failed!'
+            return -100.0
+            
+        if self._verbose:
+                print "Guess values: cen = {:.2f}, sigma = {:.2f}, I0 = {:.2f}, offset = {:.2f}".format(cen, sigma, I0, offset)
+                print "Fit values: cen = {:.2f}, sigma = {:.2f}, I0 = {:.2f}, offset = {:.2f}".format(*popt)
+        return popt[0]
+
+    def shift_e(self, func = 'gauss', guess = -1, var = 9999):
         """ 
         Shifts the energy loss spectra to align the elastic peak to the first
         scan of self.specs. Outputs the position that all scans were aligned to
         be an input for self.calibrate.
+        N.B. 
         """
         i = 0
         for spec in self.specs:        
 
             gmax = np.max(spec[1][:])
-            ind = int(spec[0][np.where(spec[1][:] == gmax)])
+            data = np.copy(spec)
+            if guess < 0:
+                ind = int(spec[0][np.where(spec[1][:] == gmax)])
+            else:
+                ind = guess
+                avg = np.average(data[1][0:int(guess-var)])
+
+                for j in range (len(spec[1])):
+                    if data[0][j] < (guess-var) or data[0][j] > (guess+var):
+                        #data[1][j] = 0.0
+                        data[1][j] = avg                      
+                        
             cnte = spec[1][ind-100]
+            
             
             #print gmax, ind, cnte
             
             if func == 'gauss':
                 def gauss(x,a,x0,sigma):
                     return a*np.exp(-(x-x0)**2/(2*sigma**2)) 
-    
-                popt,pcov = curve_fit(gauss,spec[0],spec[1],p0=[gmax,ind,1])
                 
-                #print popt
-                
-                #plt.plot(spec[0][:], spec[1][:], 'bs')
-                #plt.plot(spec[0][:], gauss(spec[0][:],popt[0],popt[1],popt[2]))
-                #plt.show()
-                #plt.figure()
-                
-                if i == 0:
-                    x_first = popt[1]
+                try:
+                    popt,pcov = curve_fit(gauss,data[0],data[1],p0=[gmax,ind,1])
+                    
+                    #plt.figure()
+                    #plt.plot(data[0], data[1], '.')  
+                    #plt.plot(data[0], gauss(data[0], popt[0], popt[1], popt[2]))
+                    #plt.show()
+                    
+                    if i == 0:
+                        x_first = popt[1]
+                    
+                    if self._verbose:
+                        print 'Center of spec #{:d}: Guess = {:0.2f}, Fit = {:0.2f}'.format(i+1, ind, popt[1])
+                    
+                except RuntimeError:
+                    print 'Failed to fit spec #{:d}. Using guess = {:0.2f}'.format(i+1, ind)
+                    popt[1] = ind
+                    
+                if np.abs(guess - popt[1]) > var:
+                    print "Fitted value looks wrong. Using guess = {:0.2f}".format(ind)
+                    popt[1] = ind
                     
                 spec[0] = spec[0] + (x_first - popt[1])
                 self.specs[i] = spec
@@ -454,13 +584,6 @@ class CCD:
                     return y
                 
                 popt,pcov = curve_fit(slit,spec[0],spec[1],p0=[gmax,ind,1,10,cnte])
-                        
-                #print popt
-                
-                #plt.plot(spec[0][:], spec[1][:], 'bs')
-                #plt.plot(spec[0][:], slit(spec[0],popt[0],popt[1],popt[2],popt[3],popt[4]))
-                #plt.show()
-                #plt.figure()
                 
                 if i == 0:
                     x_first = popt[1]
@@ -475,17 +598,6 @@ class CCD:
                 
                 spec[1] = f(spec[0])
                 
-                """
-                ind = []
-                if (x_first - popt[1]) > 0:
-                    ind = np.abs(spec[0][:] - xnew[0]) < 0.6
-                    print np.where(ind is True)
-                    for j in range (len(spec[0])):
-                        if j < ind:
-                            spec[0][j] = 0
-                        else:
-                            spec[0][j] = xnew[j-ind]
-                """
                 #spec[0]= spec[0] + (x_first - popt[1])
                 self.specs[i] = spec
                 i = i+1
@@ -505,6 +617,7 @@ class CCD:
         header += "Exclusion" + str(self.exclude) + '\n'
         header += "########################\n"
         header += "pixel \t phonons \t error \n"
+        header += self.file_header + "\n"
         M = np.column_stack((self.spectrum[0], self.spectrum[1],
                              self.spectrum[2]))
         np.savetxt(self.fileout, M, header=header)
@@ -571,15 +684,18 @@ class CCD:
             plt.plot(self.BGspecs[index][0], self.BGspecs[index][1] + offset, '.-', **kwargs)
 
     def plot_spectrum(self, offset=0.0, **kwargs):
-        """ Plot the summed spectrum using errorbar"""
+        """ Plot the summed spectrum using errorbar. **kwargs are passed to plt.plot"""
+        
         plt.errorbar(self.spectrum[0], self.spectrum[1]+ offset,
                      self.spectrum[2], fmt='.-', **kwargs)
 
 ################ INTERNAL PROCESSES ##########
-    def _gen_dark(self, M):
+    def _gen_dark(self, M, start_row_index=200, end_row_index=500):
         """ Generate image for background subtraction without real dark image
+        Data is taken between row start_row_index and end_row_index
+        the 50% percentile is taken to minimize sensitivity to spikes
         """
-        return M*0 + np.percentile(M[200:500,:], 50)
+        return M*0 + np.percentile(M[start_row_index:end_row_index,:], 50)
      
     def _clean_std(self, M, noise):
         """ Clean cosmic rays based on horizontal, curvature corrected, rows.
@@ -626,7 +742,7 @@ class CCD:
         M_cleaned[inds] = M[inds]
     
         changed_pixels = np.sum(M != M_cleaned) / ( len(M.flat)  + 0.0) # force float
-        #print "{0} % of pixels rejected".format(changed_pixels*100)
+        print "{0} % of pixels rejected".format(changed_pixels*100)
         
         return M_cleaned
 
@@ -640,7 +756,6 @@ class CCD:
         y = y = np.arange(M.shape[0]) # a column
         mean = 0.0
         
-        w = 0
         # Create curvature corrected array
         M_shifted = np.zeros(np.shape(M)) 
         for col in range(np.shape(M_shifted)[1]):
@@ -682,8 +797,32 @@ class CCD:
         # Use original pixels where row is cut due to curvature
         inds = np.isnan(M_cleaned)
         M_cleaned[inds] = M[inds]
-    
-        changed_pixels = np.sum(M != M_cleaned) / ( len(M.flat)  + 0.0) # force float
-        #print "{0} % of pixels rejected".format(changed_pixels*100)
         
         return M_cleaned
+        
+    def _get_header(self, tiff_filename):
+        """ Extract the header information and write into a text file
+        self.file_header & and dictionary self.file_dictionary
+        
+        self.file_header gets written into the output file
+        N.B. at SLS files seem to randomly change whether 
+        """
+        fid = open(tiff_filename)
+        alltxt = fid.read()
+        start = alltxt.find('[sample]')
+        if start != -1:
+            self.file_header = alltxt[start:].lower()
+    
+            self.file_dictionary = {}
+            section_header = ''
+            for line in self.file_header.splitlines():
+                try:
+                    variable, valuestr = line.split(' = ')
+                    self.file_dictionary.update({section_header + variable.lower(): float(valuestr)})
+                except ValueError:
+                    section_header = line.replace('[','').replace(']','') + '_'
+        else:
+            if self._verbose:
+                print "No ADRESS style header found."
+            self.file_header = ''
+            self.file_dictionary =''
